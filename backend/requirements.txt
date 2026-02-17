@@ -1,0 +1,46 @@
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+websockets==12.0
+
+# Azure Services
+azure-identity==1.15.0
+azure-storage-blob==12.19.0
+openai
+
+# Database
+pyodbc==5.0.1
+sqlalchemy==2.0.25
+alembic==1.13.1
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.1.2
+
+# Resume Processing
+PyMuPDF==1.23.21
+pdfplumber==0.10.4
+
+# ML & Audio/Video Processing
+numpy==1.26.3
+pandas==2.1.4
+scikit-learn==1.4.0
+scipy==1.11.4
+librosa==0.10.1
+soundfile==0.12.1
+opencv-python==4.9.0.80
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+httpx==0.26.0
+aiofiles==23.2.1
+
+# Development
+pytest==7.4.4
+pytest-asyncio==0.23.3
+black==24.1.1
+flake8==7.0.0

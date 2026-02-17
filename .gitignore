@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+build/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# Node
+node_modules/
+.next/
+out/
+.cache/
+
+# Testing
+.pytest_cache/
+.coverage
+
+# Temporary
+*.tmp
+*.bak
+
+# Azure
+.azure/
+
+# Recordings
+recordings/
+uploads/
