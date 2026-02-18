@@ -1,17 +1,12 @@
 """
-WebSocket Interview Handler.
-Manages the real-time interview session:
-- Connects to Azure OpenAI Realtime API
-- Streams AI audio to candidate
-- Receives candidate audio/text
-- Tracks metrics in real-time
-- Auto-ends after MAX_INTERVIEW_DURATION_MINUTES
+WebSocket Interview Handler with ML Analyzers integrated.
+Now uses AudioAnalyzer for real filler word detection and speech analysis.
 """
 import json
 import asyncio
 import time
 from datetime import datetime
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import WebSocket
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -20,6 +15,7 @@ from app.models.interview import InterviewStatus
 from app.models.metric import InterviewMetric
 from app.services.interview.interview_service import InterviewService
 from app.services.interview.question_generator import QuestionGeneratorService
+from app.services.ml.audio_analyzer import AudioAnalyzer
 
 
 class InterviewWebSocketHandler:
@@ -27,194 +23,150 @@ class InterviewWebSocketHandler:
     def __init__(self):
         self.interview_service  = InterviewService()
         self.question_generator = QuestionGeneratorService()
+        self.audio_analyzer     = AudioAnalyzer()
 
     async def handle(self, websocket: WebSocket, session_id: str, user_id: int):
-        """
-        Main WebSocket handler for a live interview session.
-
-        Message protocol (client → server):
-        { "type": "start" }                          - start the interview
-        { "type": "audio", "data": "<base64>" }      - audio chunk from mic
-        { "type": "text",  "data": "response text" } - text fallback
-        { "type": "video_metrics", "eye_contact": 0.8, "fidgeting": 2 }
-        { "type": "end" }                             - candidate ends early
-
-        Message protocol (server → client):
-        { "type": "ready",    "session_id": "...", "job_role": "..." }
-        { "type": "question", "text": "...", "index": 1, "total": 8 }
-        { "type": "metrics",  "filler_words": 3, "eye_contact": 0.75, ... }
-        { "type": "warning",  "message": "2 minutes remaining" }
-        { "type": "ended",    "reason": "completed|timeout|silence" }
-        { "type": "error",    "message": "..." }
-        """
         await websocket.accept()
         db = SessionLocal()
 
         try:
-            # ── Load session ──────────────────────────────────────────────────
             interview = self.interview_service._get_session(db, session_id, user_id)
 
             if interview.status == InterviewStatus.CANCELLED:
                 await self._send(websocket, {"type": "error", "message": "Session was cancelled"})
                 return
 
-            # ── Load resume data for question generation ──────────────────────
             resume     = interview.resume
             job_role   = interview.job_role or "Software Engineer"
-            skills     = resume.skills          if resume else []
+            skills     = resume.skills if resume else []
             exp_years  = resume.experience_years if resume else None
 
-            # ── Generate questions ────────────────────────────────────────────
             questions = await self.question_generator.generate_questions(
-                job_role       = job_role,
-                skills         = skills,
-                experience_years = exp_years,
-                interview_type = interview.interview_type or "job_role"
+                job_role=job_role,
+                skills=skills,
+                experience_years=exp_years,
+                interview_type=interview.interview_type or "job_role"
             )
 
-            # ── Start session ─────────────────────────────────────────────────
             self.interview_service.start_session(db, session_id, user_id)
 
-            # Send ready signal to client
             await self._send(websocket, {
-                "type":       "ready",
-                "session_id": session_id,
-                "job_role":   job_role,
+                "type":            "ready",
+                "session_id":      session_id,
+                "job_role":        job_role,
                 "total_questions": len(questions),
                 "duration_minutes": settings.MAX_INTERVIEW_DURATION_MINUTES
             })
 
-            # ── Track state ───────────────────────────────────────────────────
             state = {
                 "current_question_index": 0,
                 "questions_asked":        [],
                 "responses":              [],
+                "response_timestamps":    [],  # Track timing for pause analysis
                 "filler_words_count":     0,
                 "total_words":            0,
-                "pauses":                 [],
-                "last_speech_time":       time.time(),
+                "speech_samples":         [],  # For speech rate calculation
                 "eye_contact_scores":     [],
                 "fidgeting_events":       0,
+                "movement_history":       [],
                 "start_time":             time.time(),
                 "ended":                  False
             }
 
             max_duration = settings.MAX_INTERVIEW_DURATION_MINUTES * 60
             max_silence  = settings.MAX_SILENCE_DURATION_SECONDS
-            filler_words = {
-                "um", "uh", "like", "you know", "basically", "literally",
-                "actually", "so", "right", "okay", "hmm", "er", "ah"
-            }
 
-            # ── Ask first question ────────────────────────────────────────────
+            # Ask first question
             await self._ask_question(websocket, questions, state)
 
-            # ── Main message loop ─────────────────────────────────────────────
+            # Main loop
             while not state["ended"]:
-
-                # Check time limits
                 elapsed = time.time() - state["start_time"]
-                silence = time.time() - state["last_speech_time"]
 
+                # Check end conditions
                 if elapsed >= max_duration:
-                    await self._end_interview(
-                        websocket, db, interview, state, questions, "timeout"
-                    )
+                    await self._end_interview(websocket, db, interview, state, questions, "timeout")
                     break
 
-                if silence >= max_silence:
-                    await self._end_interview(
-                        websocket, db, interview, state, questions, "silence"
-                    )
+                if state["current_question_index"] >= len(questions):
+                    await self._end_interview(websocket, db, interview, state, questions, "completed")
                     break
 
-                # Send time warning at 2 minutes remaining
+                # Time warning
                 remaining = max_duration - elapsed
                 if 115 <= remaining <= 125:
-                    await self._send(websocket, {
-                        "type":    "warning",
-                        "message": "2 minutes remaining"
-                    })
+                    await self._send(websocket, {"type": "warning", "message": "2 minutes remaining"})
 
-                # Receive message from client
+                # Receive message
                 try:
-                    raw = await asyncio.wait_for(
-                        websocket.receive_text(),
-                        timeout=5.0
-                    )
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
                     message = json.loads(raw)
-
                 except asyncio.TimeoutError:
-                    # No message — just continue loop (check time limits)
                     continue
-
-                except WebSocketDisconnect:
-                    # Client disconnected
-                    await self._end_interview(
-                        websocket, db, interview, state, questions, "disconnected"
-                    )
+                except Exception:
+                    await self._end_interview(websocket, db, interview, state, questions, "disconnected")
                     break
 
                 msg_type = message.get("type")
 
-                # ── Handle client messages ────────────────────────────────────
+                # Handle text response
                 if msg_type == "text":
-                    # Candidate spoke — process response
                     response_text = message.get("data", "")
-                    state["last_speech_time"] = time.time()
+                    timestamp = time.time()
 
-                    # Count words and filler words
-                    words = response_text.lower().split()
-                    state["total_words"] += len(words)
-                    for fw in filler_words:
-                        state["filler_words_count"] += response_text.lower().count(fw)
+                    # Use AudioAnalyzer to analyze the response
+                    analysis = self.audio_analyzer.analyze_text(response_text)
+
+                    # Update state with analyzed data
+                    state["filler_words_count"] += analysis["filler_words_count"]
+                    state["total_words"] += analysis["total_words"]
+                    state["speech_samples"].append({
+                        "words": analysis["total_words"],
+                        "fillers": analysis["filler_words_count"],
+                        "timestamp": timestamp
+                    })
 
                     # Store response
                     if state["current_question_index"] <= len(questions):
                         state["responses"].append({
                             "question_index": state["current_question_index"] - 1,
                             "response":       response_text,
-                            "timestamp":      datetime.utcnow().isoformat()
+                            "timestamp":      datetime.utcnow().isoformat(),
+                            "word_count":     analysis["total_words"],
+                            "filler_count":   analysis["filler_words_count"]
                         })
+                        state["response_timestamps"].append(timestamp)
 
-                    # Send updated metrics to client
                     await self._send_metrics(websocket, state, elapsed)
 
-                    # Move to next question if response received
+                    # Move to next question
                     if state["current_question_index"] < len(questions):
-                        await asyncio.sleep(1.5)  # brief pause between Q&A
+                        await asyncio.sleep(1.5)
                         await self._ask_question(websocket, questions, state)
                     else:
-                        # All questions done
-                        await self._end_interview(
-                            websocket, db, interview, state, questions, "completed"
-                        )
+                        await self._end_interview(websocket, db, interview, state, questions, "completed")
                         break
 
+                # Handle video metrics from client
                 elif msg_type == "video_metrics":
-                    # Receive MediaPipe metrics from frontend
                     eye_contact = message.get("eye_contact", 0.0)
-                    fidgeting   = message.get("fidgeting",   0)
+                    movement    = message.get("movement", 0.0)
+                    fidgeting   = message.get("fidgeting", 0)
 
                     state["eye_contact_scores"].append(eye_contact)
-                    state["fidgeting_events"]  += fidgeting
+                    state["movement_history"].append(movement)
+                    state["fidgeting_events"] += fidgeting
 
+                # Handle end button
                 elif msg_type == "end":
-                    # Candidate ends early
-                    await self._end_interview(
-                        websocket, db, interview, state, questions, "candidate_ended"
-                    )
+                    await self._end_interview(websocket, db, interview, state, questions, "candidate_ended")
                     break
 
-            # ── Save metrics to DB ────────────────────────────────────────────
             await self._save_metrics(db, interview.id, state)
 
         except Exception as e:
             print(f"WebSocket error: {e}")
-            await self._send(websocket, {
-                "type":    "error",
-                "message": f"Session error: {str(e)}"
-            })
+            await self._send(websocket, {"type": "error", "message": f"Session error: {str(e)}"})
 
         finally:
             db.close()
@@ -224,9 +176,7 @@ class InterviewWebSocketHandler:
                 pass
 
     async def _ask_question(self, websocket: WebSocket, questions: list, state: dict):
-        """Send the next question to the client."""
         idx = state["current_question_index"]
-
         if idx >= len(questions):
             return
 
@@ -243,7 +193,13 @@ class InterviewWebSocketHandler:
         })
 
     async def _send_metrics(self, websocket: WebSocket, state: dict, elapsed: float):
-        """Send real-time metrics update to client."""
+        # Calculate speech rate
+        speech_rate = 0
+        if state["speech_samples"] and elapsed > 0:
+            total_words = sum(s["words"] for s in state["speech_samples"])
+            speech_rate = (total_words / elapsed) * 60  # WPM
+
+        # Calculate average eye contact
         eye_avg = (
             sum(state["eye_contact_scores"]) / len(state["eye_contact_scores"])
             if state["eye_contact_scores"] else 0.0
@@ -253,7 +209,8 @@ class InterviewWebSocketHandler:
             "type":                "metrics",
             "filler_words_count":  state["filler_words_count"],
             "total_words":         state["total_words"],
-            "eye_contact":         round(eye_avg, 2),
+            "speech_rate_wpm":     round(speech_rate, 1),
+            "eye_contact":         round(eye_avg * 100, 1),
             "fidgeting_count":     state["fidgeting_events"],
             "elapsed_seconds":     int(elapsed),
             "questions_answered":  state["current_question_index"] - 1
@@ -265,25 +222,23 @@ class InterviewWebSocketHandler:
         db: Session,
         interview,
         state: dict,
-        reason: str,
-        questions: list = None
+        questions: list,
+        reason: str
     ):
-        """Gracefully end the interview and notify client."""
         state["ended"] = True
 
-        # End session in DB
         self.interview_service.end_session(
-            db             = db,
-            session_id     = interview.session_id,
-            user_id        = interview.user_id,
+            db              = db,
+            session_id      = interview.session_id,
+            user_id         = interview.user_id,
             questions_asked = state["questions_asked"],
             responses_given = state["responses"]
         )
 
-        # Notify client
         await self._send(websocket, {
             "type":              "ended",
             "reason":            reason,
+            "interview_id":      interview.id,
             "total_questions":   len(state["questions_asked"]),
             "total_words":       state["total_words"],
             "filler_words":      state["filler_words_count"],
@@ -293,26 +248,38 @@ class InterviewWebSocketHandler:
 
     def _end_message(self, reason: str) -> str:
         messages = {
-            "completed":       "Great job! You've completed the interview. Generating feedback...",
-            "timeout":         "Time's up! Great effort. Generating feedback...",
-            "silence":         "Session ended due to inactivity. Generating feedback...",
-            "candidate_ended": "Interview ended. Generating feedback...",
+            "completed":       "Great job! You've completed the interview.",
+            "timeout":         "Time's up! Great effort.",
+            "silence":         "Session ended due to inactivity.",
+            "candidate_ended": "Interview ended.",
             "disconnected":    "Connection lost. Your progress has been saved."
         }
         return messages.get(reason, "Interview ended.")
 
     async def _save_metrics(self, db: Session, interview_id: int, state: dict):
-        """Persist aggregated metrics to DB."""
         try:
+            # Calculate aggregated metrics
             eye_avg = (
                 sum(state["eye_contact_scores"]) / len(state["eye_contact_scores"])
                 if state["eye_contact_scores"] else 0.0
             )
 
+            # Calculate pause metrics
+            pause_analysis = self.audio_analyzer.detect_pauses(
+                [(i, "") for i, _ in enumerate(state["response_timestamps"])]
+            )
+
+            # Calculate speech rate
+            duration = time.time() - state["start_time"]
+            speech_rate = (state["total_words"] / duration * 60) if duration > 0 else 0
+
             metric = InterviewMetric(
                 interview_id           = interview_id,
                 filler_words_count     = state["filler_words_count"],
                 total_words_spoken     = state["total_words"],
+                average_pause_duration = pause_analysis.get("avg_pause_duration", 0.0),
+                longest_pause_duration = pause_analysis.get("max_pause_duration", 0.0),
+                speech_rate_wpm        = round(speech_rate, 1),
                 eye_contact_percentage = round(eye_avg * 100, 1),
                 fidgeting_count        = state["fidgeting_events"],
             )
@@ -322,8 +289,7 @@ class InterviewWebSocketHandler:
             print(f"Failed to save metrics: {e}")
 
     async def _send(self, websocket: WebSocket, data: dict):
-        """Send JSON message to client."""
         try:
             await websocket.send_text(json.dumps(data))
         except Exception:
-            pass  # client may have disconnected
+            pass
