@@ -1,11 +1,10 @@
 """
-Azure Blob Storage service.
-Handles all file upload/download/delete operations.
+Updated Storage Service with video upload support.
+REPLACE: backend/app/services/storage/storage_service.py
 """
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from datetime import datetime, timedelta
 import uuid
-import os
 
 from app.core.config import settings
 
@@ -13,88 +12,82 @@ from app.core.config import settings
 class StorageService:
 
     def __init__(self):
-        self.client = BlobServiceClient.from_connection_string(
+        self.blob_service = BlobServiceClient.from_connection_string(
             settings.AZURE_STORAGE_CONNECTION_STRING
         )
-        self.container = settings.AZURE_STORAGE_CONTAINER_NAME
+        self.container_name = settings.AZURE_STORAGE_CONTAINER_NAME
 
-    def upload_resume(self, file_bytes: bytes, original_filename: str, user_id: int) -> dict:
+    def upload_resume(self, file_data: bytes, user_id: int) -> tuple:
         """
-        Upload a resume PDF to Azure Blob Storage.
-
+        Upload resume PDF to blob storage.
+        
         Returns:
-            dict with blob_url, blob_name, file_size
+            (blob_url, file_size)
         """
-        # Generate unique blob name: resumes/user_1/uuid_filename.pdf
-        ext = os.path.splitext(original_filename)[1].lower()
-        blob_name = f"resumes/user_{user_id}/{uuid.uuid4().hex}{ext}"
-
-        blob_client = self.client.get_blob_client(
-            container=self.container,
-            blob=blob_name
+        filename = f"resumes/user_{user_id}/{uuid.uuid4()}.pdf"
+        
+        blob_client = self.blob_service.get_blob_client(
+            container=self.container_name,
+            blob=filename
         )
-
+        
         blob_client.upload_blob(
-            file_bytes,
+            file_data,
             overwrite=True,
             content_settings=ContentSettings(content_type="application/pdf")
         )
+        
+        blob_url = blob_client.url
+        file_size = len(file_data)
+        
+        return blob_url, file_size
 
-        return {
-            "blob_name": blob_name,
-            "blob_url": blob_client.url,
-            "file_size": len(file_bytes)
-        }
-
-    def upload_video(self, file_bytes: bytes, session_id: str) -> dict:
+    def upload_video(self, file_data, blob_path: str) -> str:
         """
-        Upload an interview recording to Azure Blob Storage.
-        Sets a TTL tag for automatic deletion after VIDEO_RETENTION_DAYS.
-
+        Upload interview video recording to blob storage.
+        Sets 30-day retention policy.
+        
+        Args:
+            file_data: File bytes or file-like object
+            blob_path: Path in blob storage (e.g., 'interviews/user_3/interview_5/recording.webm')
+        
         Returns:
-            dict with blob_url, blob_name, file_size
+            blob_url: Full URL to the uploaded video
         """
-        blob_name = f"recordings/{session_id}/{uuid.uuid4().hex}.webm"
-
-        blob_client = self.client.get_blob_client(
-            container=self.container,
-            blob=blob_name
+        blob_client = self.blob_service.get_blob_client(
+            container=self.container_name,
+            blob=blob_path
         )
-
-        # Tag with expiry date for lifecycle management
-        expiry_date = (
-            datetime.utcnow() + timedelta(days=settings.VIDEO_RETENTION_DAYS)
-        ).strftime("%Y-%m-%d")
-
+        
+        # Set retention - video auto-deletes after 30 days
+        expiry_time = datetime.utcnow() + timedelta(days=settings.VIDEO_RETENTION_DAYS)
+        
+        # Upload video
         blob_client.upload_blob(
-            file_bytes,
+            file_data,
             overwrite=True,
             content_settings=ContentSettings(content_type="video/webm"),
-            tags={"expiry_date": expiry_date}
+            metadata={
+                "retention_days": str(settings.VIDEO_RETENTION_DAYS),
+                "expires_at": expiry_time.isoformat()
+            }
         )
+        
+        return blob_client.url
 
-        return {
-            "blob_name": blob_name,
-            "blob_url": blob_client.url,
-            "file_size": len(file_bytes)
-        }
-
-    def delete_blob(self, blob_name: str) -> bool:
-        """Delete a blob by name. Returns True if deleted."""
-        try:
-            blob_client = self.client.get_blob_client(
-                container=self.container,
-                blob=blob_name
-            )
-            blob_client.delete_blob()
-            return True
-        except Exception:
-            return False
-
-    def get_blob_url(self, blob_name: str) -> str:
-        """Get the public URL for a blob."""
-        blob_client = self.client.get_blob_client(
-            container=self.container,
+    def delete_blob(self, blob_url: str):
+        """Delete a blob by URL."""
+        blob_name = blob_url.split(f"{self.container_name}/")[-1]
+        blob_client = self.blob_service.get_blob_client(
+            container=self.container_name,
             blob=blob_name
+        )
+        blob_client.delete_blob()
+
+    def get_blob_url(self, blob_path: str) -> str:
+        """Get full URL for a blob path."""
+        blob_client = self.blob_service.get_blob_client(
+            container=self.container_name,
+            blob=blob_path
         )
         return blob_client.url

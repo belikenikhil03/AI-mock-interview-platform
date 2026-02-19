@@ -4,12 +4,14 @@ Trigger feedback generation and retrieve results.
 """
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+import json
 
 from app.core.database import get_db
 from app.api.dependencies.deps import get_current_user
 from app.api.schemas.feedback import FeedbackResponse
 from app.services.feedback.feedback_service import FeedbackService
 from app.models.user import User
+from app.models.interview import Interview
 
 router = APIRouter()
 
@@ -55,3 +57,68 @@ def get_feedback(
     service  = FeedbackService()
     feedback = service.get_feedback(db, interview_id, current_user.id)
     return feedback
+
+@router.get("/{interview_id}/with-timeline", summary="Get feedback with video timeline")
+async def get_feedback_with_timeline(
+    interview_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get feedback along with video timeline for playback.
+    Used in the feedback page with video player.
+    """
+    from app.services.recording.event_logger import EventLogger
+    
+    # Get feedback
+    service = FeedbackService()
+    feedback = service.get_feedback(db, interview_id, current_user.id)
+    
+    # Get interview
+    interview = db.query(Interview).filter(
+        Interview.id == interview_id,
+        Interview.user_id == current_user.id
+    ).first()
+    
+    # Get timeline events
+    events = EventLogger.get_timeline(db, interview_id)
+    grouped = EventLogger.group_nearby_events(events, time_window=5.0)
+    
+    return {
+        "feedback": {
+            "id": feedback.id,
+            "interview_id": feedback.interview_id,
+            "overall_score": feedback.overall_score,
+            "content_score": feedback.content_score,
+            "communication_score": feedback.communication_score,
+            "confidence_score": feedback.confidence_score,
+            "what_went_right": feedback.what_went_right,
+            "what_went_wrong": feedback.what_went_wrong,
+            "strengths": feedback.strengths,
+            "weaknesses": feedback.weaknesses,
+            "detailed_feedback": feedback.detailed_feedback,
+            "improvement_suggestions": feedback.improvement_suggestions
+        },
+        "video": {
+            "url": interview.video_blob_url,
+            "duration_seconds": interview.video_duration_seconds,
+            "total_events": len(events)
+        },
+        "timeline": [
+            {
+                "start_time": group[0].timestamp_seconds,
+                "end_time": group[-1].timestamp_seconds,
+                "count": len(group),
+                "events": [
+                    {
+                        "timestamp": e.timestamp_seconds,
+                        "type": e.event_type,
+                        "data": json.loads(e.event_data) if e.event_data else {},
+                        "severity": e.severity
+                    }
+                    for e in group
+                ]
+            }
+            for group in grouped
+        ]
+    }

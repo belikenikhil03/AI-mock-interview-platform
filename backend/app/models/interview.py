@@ -1,41 +1,52 @@
-"""interview.py - Interview session model"""
-import enum
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, JSON, Enum as SQLEnum
+"""
+Updated Interview model with video recording support.
+REPLACE: backend/app/models/interview.py
+"""
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, JSON
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
+from datetime import datetime
+import enum
+
 from app.core.database import Base
 
 
 class InterviewStatus(str, enum.Enum):
-    PENDING     = "pending"
-    IN_PROGRESS = "in_progress"
-    COMPLETED   = "completed"
-    FAILED      = "failed"
-    CANCELLED   = "cancelled"
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
 
 
 class Interview(Base):
     __tablename__ = "interviews"
 
-    id             = Column(Integer, primary_key=True, index=True)
-    user_id        = Column(Integer, ForeignKey("users.id"),   nullable=False, index=True)
-    resume_id      = Column(Integer, ForeignKey("resumes.id"), nullable=True,  index=True)
-    session_id     = Column(String(100), unique=True, index=True, nullable=False)
-    status         = Column(SQLEnum(InterviewStatus), default=InterviewStatus.PENDING, nullable=False)
-    job_role       = Column(String(255), nullable=True)
-    interview_type = Column(String(100), nullable=True)
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    session_id = Column(String(255), unique=True, nullable=False, index=True)
+    
+    status = Column(Enum(InterviewStatus), default=InterviewStatus.PENDING)
+    job_role = Column(String(255), nullable=True)
+    interview_type = Column(String(100), default="job_role")
+    
+    # Timing
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    duration_seconds = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Interview data
+    questions_asked = Column(JSON, nullable=True)
+    responses_given = Column(JSON, nullable=True)
+    
+    # Video recording - NEW
     video_blob_url = Column(String(500), nullable=True)
-    duration_seconds = Column(Integer,  nullable=True)
-    questions_asked  = Column(JSON,     nullable=True)
-    responses_given  = Column(JSON,     nullable=True)
-    started_at     = Column(DateTime(timezone=True), nullable=True)
-    completed_at   = Column(DateTime(timezone=True), nullable=True)
-    created_at     = Column(DateTime(timezone=True), server_default=func.now())
-
-    user     = relationship("User",            back_populates="interviews")
-    resume   = relationship("Resume",          back_populates="interviews")
-    feedback = relationship("Feedback",        back_populates="interview", uselist=False, cascade="all, delete-orphan")
-    metrics  = relationship("InterviewMetric", back_populates="interview", cascade="all, delete-orphan")
-
-    def __repr__(self):
-        return f"<Interview(id={self.id}, session_id='{self.session_id}', status='{self.status}')>"
+    video_duration_seconds = Column(Integer, nullable=True)
+    total_events_count = Column(Integer, default=0)
+    
+    # Relationships
+    user = relationship("User", back_populates="interviews")
+    resume = relationship("Resume", back_populates="interviews")
+    feedback = relationship("Feedback", back_populates="interview", uselist=False)
+    metrics = relationship("InterviewMetric", back_populates="interview")
+    events = relationship("InterviewEvent", back_populates="interview", cascade="all, delete-orphan")

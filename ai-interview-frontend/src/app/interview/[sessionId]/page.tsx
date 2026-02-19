@@ -1,94 +1,184 @@
-// src/app/interview/[sessionId]/page.tsx - FINAL WORKING VERSION
+// COMPLETE REWRITE: ai-interview-frontend/src/app/interview/[sessionId]/page.tsx
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 
-export default function InterviewPage() {
+export default function VoiceInterviewPage() {
   const router = useRouter();
   const params = useParams();
   const sessionId = params.sessionId as string;
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const cameraInitialized = useRef(false); // Prevent double init
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const timelineRef = useRef<any[]>([]);
+  const interviewStartTimeRef = useRef<number>(0);
+
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [status, setStatus] = useState<'connecting' | 'ready' | 'active' | 'ended'>('connecting');
   const [currentQuestion, setCurrentQuestion] = useState('');
   const [questionIndex, setQuestionIndex] = useState(0);
-  const [totalQuestions, setTotalQuestions] = useState(8);
-  const [answer, setAnswer] = useState('');
-  const [metrics, setMetrics] = useState({
-    filler_words: 0,
-    total_words: 0,
-    speech_rate_wpm: 0,
-    questions_answered: 0,
-  });
-  const [timeRemaining, setTimeRemaining] = useState(480);
+  const [aiSpeaking, setAiSpeaking] = useState(false);
+  const [candidateSpeaking, setCandidateSpeaking] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
+  const [interviewId, setInterviewId] = useState<number | null>(null);
+
+  // Audio context for playing AI voice
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioQueueRef = useRef<AudioBufferSourceNode[]>([]);
+
+  // Speech recognition
+  const recognitionRef = useRef<any>(null);
+  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
-    if (!cameraInitialized.current) {
-      cameraInitialized.current = true;
-      startCamera();
+    const timer = setTimeout(() => {
+      initCamera();
+      initAudio();
+      initSpeechRecognition();
       connectWebSocket();
-    }
-    
+    }, 100);
+
     return () => {
-      stopCamera();
-      if (ws) ws.close();
+      clearTimeout(timer);
+      stopEverything();
     };
   }, []);
 
-  useEffect(() => {
-    if (status === 'ended') {
-      stopCamera();
-    }
-  }, [status]);
-
-  useEffect(() => {
-    if (status === 'active') {
-      const timer = setInterval(() => {
-        setTimeRemaining((prev) => Math.max(0, prev - 1));
-      }, 1000);
-      return () => clearInterval(timer);
-    }
-  }, [status]);
-
-  const startCamera = async () => {
-    if (!navigator?.mediaDevices?.getUserMedia) {
-      console.error('Camera not supported');
+  const initCamera = async () => {
+    const video = document.getElementById('interview-video') as HTMLVideoElement;
+    if (!video) {
+      setTimeout(initCamera, 200);
       return;
     }
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { width: 640, height: 480, facingMode: 'user' },
-        audio: false 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720, facingMode: 'user' },
+        audio: true
       });
-      
-      streamRef.current = stream;
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-        setCameraActive(true);
-        console.log('✅ Camera active');
-      }
+
+      video.srcObject = stream;
+      await video.play();
+      setCameraActive(true);
+
+      // Start recording
+      startRecording(stream);
+
     } catch (err) {
       console.error('Camera error:', err);
     }
   };
 
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
+  const startRecording = (stream: MediaStream) => {
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType: 'video/webm;codecs=vp9',
+      videoBitsPerSecond: 2500000
+    });
+
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        recordedChunksRef.current.push(event.data);
+      }
+    };
+
+    mediaRecorder.onstop = () => {
+      uploadRecording();
+    };
+
+    mediaRecorder.start(1000); // Capture chunks every second
+    mediaRecorderRef.current = mediaRecorder;
+
+    // Mark interview start time
+    interviewStartTimeRef.current = Date.now();
+  };
+
+  const initAudio = () => {
+    if (typeof window !== 'undefined') {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
+  };
+
+  const initSpeechRecognition = () => {
+    if (typeof window === 'undefined') return;
+
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.warn('Speech recognition not supported');
+      return;
     }
-    setCameraActive(false);
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+
+    let finalTranscript = '';
+
+    recognition.onresult = (event: any) => {
+      let interimTranscript = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript + ' ';
+          
+          // Log filler words
+          detectFillerWords(transcript, getCurrentTimestamp());
+        } else {
+          interimTranscript += transcript;
+        }
+      }
+
+      // Reset silence timer on speech
+      if (silenceTimerRef.current) {
+        clearTimeout(silenceTimerRef.current);
+      }
+
+      // Set 2.5s silence timer
+      silenceTimerRef.current = setTimeout(() => {
+        if (finalTranscript.trim() && ws) {
+          ws.send(JSON.stringify({
+            type: 'response_complete',
+            transcript: finalTranscript.trim()
+          }));
+          finalTranscript = '';
+        }
+      }, 2500);
+
+      setCandidateSpeaking(interimTranscript.length > 0);
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error('Speech recognition error:', event.error);
+    };
+
+    recognitionRef.current = recognition;
+  };
+
+  const detectFillerWords = (text: string, timestamp: number) => {
+    const fillerWords = ['um', 'uh', 'like', 'you know', 'basically', 'literally'];
+    const words = text.toLowerCase().split(' ');
+
+    words.forEach(word => {
+      if (fillerWords.includes(word.replace(/[.,!?]/g, ''))) {
+        logEvent({
+          timestamp,
+          type: 'filler_word',
+          data: { word },
+          severity: 'warning'
+        });
+      }
+    });
+  };
+
+  const logEvent = (event: any) => {
+    timelineRef.current.push(event);
+  };
+
+  const getCurrentTimestamp = () => {
+    return (Date.now() - interviewStartTimeRef.current) / 1000;
   };
 
   const connectWebSocket = () => {
@@ -98,128 +188,230 @@ export default function InterviewPage() {
       return;
     }
 
-    const websocket = new WebSocket(`ws://localhost:8000/api/interviews/${sessionId}/ws?token=${token}`);
+    const wsUrl = `ws://localhost:8000/api/interviews/${sessionId}/ws?token=${token}`;
+    const websocket = new WebSocket(wsUrl);
 
-    websocket.onmessage = (event) => {
+    websocket.onopen = () => {
+      console.log('✅ WebSocket connected');
+    };
+
+    websocket.onmessage = async (event) => {
       const message = JSON.parse(event.data);
-      
-      switch (message.type) {
-        case 'ready':
-          setStatus('ready');
-          setTotalQuestions(message.total_questions);
-          break;
-        case 'question':
-          setCurrentQuestion(message.text);
-          setQuestionIndex(message.index);
-          setStatus('active');
-          setAnswer('');
-          break;
-        case 'metrics':
-          setMetrics({
-            filler_words: message.filler_words_count,
-            total_words: message.total_words,
-            speech_rate_wpm: message.speech_rate_wpm || 0,
-            questions_answered: message.questions_answered,
-          });
-          break;
-        case 'ended':
-          setStatus('ended');
-          stopCamera();
-          setTimeout(() => router.push(message.interview_id ? `/feedback/${message.interview_id}` : '/dashboard'), 2000);
-          break;
-      }
+      handleMessage(message);
     };
 
     websocket.onerror = () => {
-      stopCamera();
+      alert('Connection failed');
       router.push('/dashboard');
     };
 
-    websocket.onclose = stopCamera;
+    websocket.onclose = () => {
+      stopEverything();
+    };
 
     setWs(websocket);
   };
 
-  const sendAnswer = () => {
-    if (answer.trim() && ws) {
-      ws.send(JSON.stringify({ type: 'text', data: answer.trim() }));
-      setAnswer('');
+  const handleMessage = async (message: any) => {
+    switch (message.type) {
+      case 'ready':
+        setStatus('ready');
+        // Start speech recognition
+        if (recognitionRef.current) {
+          recognitionRef.current.start();
+        }
+        break;
+
+      case 'question':
+        setCurrentQuestion(message.text);
+        setQuestionIndex(message.index);
+        setStatus('active');
+        setAiSpeaking(true);
+        logEvent({
+          timestamp: getCurrentTimestamp(),
+          type: 'question_asked',
+          data: { question: message.text, index: message.index },
+          severity: 'info'
+        });
+        break;
+
+      case 'ai_audio':
+        await playAudioChunk(message.audio);
+        break;
+
+      case 'ai_done_speaking':
+        setAiSpeaking(false);
+        break;
+
+      case 'ended':
+        setStatus('ended');
+        setInterviewId(message.interview_id);
+        stopEverything();
+        break;
+    }
+  };
+
+  const playAudioChunk = async (audioBase64: string) => {
+    if (!audioContextRef.current) return;
+
+    try {
+      const audioData = Uint8Array.from(atob(audioBase64), c => c.charCodeAt(0));
+      const audioBuffer = await audioContextRef.current.decodeAudioData(audioData.buffer);
+
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioContextRef.current.destination);
+      source.start();
+
+      audioQueueRef.current.push(source);
+    } catch (err) {
+      console.error('Audio playback error:', err);
+    }
+  };
+
+  const stopEverything = () => {
+    // Stop recording
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
+    // Stop speech recognition
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
+
+    // Stop camera
+    if (videoRef.current?.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+    }
+
+    setCameraActive(false);
+  };
+
+  const uploadRecording = async () => {
+    if (!interviewId || recordedChunksRef.current.length === 0) return;
+
+    const videoBlob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+    const duration = Math.floor((Date.now() - interviewStartTimeRef.current) / 1000);
+
+    const formData = new FormData();
+    formData.append('video', videoBlob, 'recording.webm');
+    formData.append('timeline', JSON.stringify(timelineRef.current));
+    formData.append('duration', duration.toString());
+
+    const token = localStorage.getItem('token');
+
+    try {
+      const response = await fetch(
+        `http://localhost:8000/api/recordings/interviews/${interviewId}/upload-recording`,
+        {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}` },
+          body: formData
+        }
+      );
+
+      if (response.ok) {
+        console.log('✅ Recording uploaded');
+        setTimeout(() => router.push(`/feedback/${interviewId}`), 2000);
+      }
+    } catch (err) {
+      console.error('Upload failed:', err);
+      setTimeout(() => router.push(`/feedback/${interviewId}`), 2000);
     }
   };
 
   const endInterview = () => {
     if (ws && confirm('End interview?')) {
       ws.send(JSON.stringify({ type: 'end' }));
-      stopCamera();
     }
   };
-
-  const formatTime = (s: number) => `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
 
   return (
     <div className="min-h-screen bg-gray-900 text-white">
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
           <div>
-            <h1 className="text-xl font-bold">Live Interview</h1>
-            <p className="text-sm text-gray-400">Session: {sessionId.slice(0,8)}...</p>
+            <h1 className="text-xl font-bold">🎤 Voice Interview</h1>
+            <p className="text-sm text-gray-400">Session: {sessionId.slice(0, 8)}...</p>
           </div>
-          <div className="flex items-center gap-6">
-            <div className="text-right">
-              <div className="text-2xl font-mono font-bold">{formatTime(timeRemaining)}</div>
-              <div className="text-xs text-gray-400">Time Remaining</div>
-            </div>
-            <div className={`w-3 h-3 rounded-full ${status==='active'?'bg-green-500 animate-pulse':'bg-gray-500'}`}/>
-          </div>
+          <div className={`w-3 h-3 rounded-full ${status === 'active' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8">
-        {status==='connecting' && <div className="text-center py-20"><div className="text-xl">Connecting...</div></div>}
-        {status==='ready' && <div className="text-center py-20"><div className="text-2xl font-bold mb-4">🎤 Ready!</div></div>}
-        {status==='ended' && <div className="text-center py-20"><div className="text-3xl font-bold mb-4">✅ Complete!</div></div>}
-        
-        {status==='active' && (
+        {status === 'connecting' && (
+          <div className="text-center py-20">
+            <div className="text-xl">Connecting...</div>
+          </div>
+        )}
+
+        {status === 'ready' && (
+          <div className="text-center py-20">
+            <div className="text-2xl font-bold mb-4">🎤 Interview Ready!</div>
+            <div className="text-gray-400">AI is preparing your first question...</div>
+          </div>
+        )}
+
+        {status === 'ended' && (
+          <div className="text-center py-20">
+            <div className="text-3xl font-bold mb-4">✅ Complete!</div>
+            <div className="text-gray-400">Uploading recording...</div>
+          </div>
+        )}
+
+        {status === 'active' && (
           <div className="grid md:grid-cols-3 gap-6">
             <div className="md:col-span-2 space-y-6">
-              <div className="bg-gray-800 rounded-xl overflow-hidden border border-gray-700">
-                <video ref={videoRef} autoPlay playsInline muted className="w-full h-64 object-cover" style={{transform:'scaleX(-1)'}}/>
-                <div className="p-3 bg-gray-800/50 flex justify-between text-xs">
-                  <span>📹 Recording</span>
-                  <span className={cameraActive?'text-green-400':'text-red-400'}>{cameraActive?'● Active':'● Off'}</span>
+              {/* AI Avatar */}
+              <div className="bg-gray-800 rounded-xl p-6 border border-gray-700 text-center">
+                <div className={`w-32 h-32 mx-auto rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-5xl mb-4 ${aiSpeaking ? 'ring-4 ring-blue-400 animate-pulse' : ''}`}>
+                  👨‍💼
+                </div>
+                <div className="text-sm text-gray-400">
+                  {aiSpeaking ? '🎤 AI Speaking...' : '👂 AI Listening...'}
                 </div>
               </div>
 
+              {/* Question Display */}
               <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <div className="flex justify-between mb-4 text-sm text-gray-400">
-                  <span>Q {questionIndex}/{totalQuestions}</span>
-                  <div className="h-2 w-32 bg-gray-700 rounded-full overflow-hidden">
-                    <div className="h-full bg-blue-500" style={{width:`${(questionIndex/totalQuestions)*100}%`}}/>
-                  </div>
-                </div>
+                <div className="text-sm text-gray-400 mb-2">Question {questionIndex}</div>
                 <div className="text-xl font-medium">{currentQuestion}</div>
               </div>
 
-              <div className="bg-gray-800 rounded-xl p-6 border border-gray-700">
-                <textarea value={answer} onChange={e=>setAnswer(e.target.value)} onKeyDown={e=>e.key==='Enter'&&e.ctrlKey&&sendAnswer()} placeholder="Type answer (Ctrl+Enter)" className="w-full h-32 bg-gray-900 border border-gray-700 rounded-lg p-4 text-white placeholder-gray-500 focus:ring-2 focus:ring-blue-500 resize-none"/>
-                <div className="flex justify-between mt-4">
-                  <span className="text-sm text-gray-500">{answer.split(' ').filter(Boolean).length} words</span>
-                  <div className="flex gap-3">
-                    <button onClick={endInterview} className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm">End</button>
-                    <button onClick={sendAnswer} disabled={!answer.trim()} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-700 rounded-lg">Submit →</button>
-                  </div>
+              {/* Video Feed */}
+              <div className="bg-gray-800 rounded-xl overflow-hidden border border-gray-700">
+                <video
+                  id="interview-video"
+                  autoPlay
+                  playsInline
+                  muted
+                  className="w-full h-64 object-cover"
+                  style={{ transform: 'scaleX(-1)' }}
+                />
+                <div className="p-3 bg-gray-800/50 flex justify-between text-xs">
+                  <span>{candidateSpeaking ? '🎤 You are speaking...' : '⏸️ Listening...'}</span>
+                  <span className={cameraActive ? 'text-green-400' : 'text-red-400'}>
+                    {cameraActive ? '● Recording' : '● Off'}
+                  </span>
                 </div>
               </div>
+
+              <button onClick={endInterview} className="w-full px-4 py-3 bg-red-600 hover:bg-red-700 rounded-lg font-medium">
+                End Interview
+              </button>
             </div>
 
             <div className="bg-gray-800 rounded-xl p-4 border border-gray-700">
-              <h3 className="text-sm font-medium text-gray-400 mb-3">Metrics</h3>
-              <div className="space-y-3">
-                <div><div className="text-2xl font-bold text-blue-400">{metrics.questions_answered}</div><div className="text-xs text-gray-500">Questions</div></div>
-                <div><div className="text-2xl font-bold text-green-400">{metrics.total_words}</div><div className="text-xs text-gray-500">Words</div></div>
-                <div><div className="text-2xl font-bold text-yellow-400">{metrics.filler_words}</div><div className="text-xs text-gray-500">Fillers</div></div>
-                <div><div className="text-2xl font-bold text-purple-400">{metrics.speech_rate_wpm}</div><div className="text-xs text-gray-500">WPM</div></div>
-              </div>
+              <h3 className="text-sm font-medium text-gray-400 mb-3">💡 Tips</h3>
+              <ul className="text-xs text-gray-500 space-y-2">
+                <li>• Speak clearly into your microphone</li>
+                <li>• Look at the camera</li>
+                <li>• Avoid filler words (um, uh, like)</li>
+                <li>• Use the STAR method</li>
+                <li>• Take brief pauses to think</li>
+              </ul>
             </div>
           </div>
         )}
