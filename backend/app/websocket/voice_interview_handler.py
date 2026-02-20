@@ -1,6 +1,6 @@
 """
-Voice Interview WebSocket Handler.
-backend/app/websocket/voice_interview_handler.py
+Complete Voice Interview WebSocket Handler with Realtime API integration.
+REPLACE: backend/app/websocket/voice_interview_handler.py
 """
 import json
 import asyncio
@@ -30,7 +30,7 @@ class VoiceInterviewHandler:
         realtime_client = None
 
         try:
-            # Load session
+            # Load interview session
             interview = self.interview_service._get_session(db, session_id, user_id)
             
             if interview.status == InterviewStatus.CANCELLED:
@@ -48,22 +48,29 @@ class VoiceInterviewHandler:
                 skills=skills,
                 experience_years=exp_years,
                 interview_type=interview.interview_type or "job_role",
-                num_questions=20  # Generate pool of questions
+                num_questions=20
             )
 
             # Start interview
             self.interview_service.start_session(db, session_id, user_id)
 
-            # Connect to Realtime API
+            # Connect to Azure Realtime API
             realtime_client = RealtimeAPIClient()
-            await realtime_client.connect()
+            connected = await realtime_client.connect()
+            
+            if not connected:
+                await self._send(websocket, {"type": "error", "message": "Failed to connect to AI service"})
+                return
 
-            # Set up audio callback
+            # Setup callbacks for audio streaming
             async def on_audio(audio_b64: str):
                 await self._send(websocket, {
                     "type": "ai_audio",
                     "audio": audio_b64
                 })
+
+            async def on_transcript(text: str):
+                print(f"AI transcript: {text}")
 
             async def on_done():
                 await self._send(websocket, {
@@ -71,6 +78,7 @@ class VoiceInterviewHandler:
                 })
 
             realtime_client.on_audio_callback = on_audio
+            realtime_client.on_transcript_callback = on_transcript
             realtime_client.on_done_callback = on_done
 
             # State
@@ -81,7 +89,7 @@ class VoiceInterviewHandler:
                 "start_time": time.time(),
                 "ended": False,
                 "wrap_up_initiated": False,
-                "ai_speaking": False
+                "waiting_for_ai": False
             }
 
             # Send ready
@@ -92,19 +100,26 @@ class VoiceInterviewHandler:
             })
 
             # AI Introduction
-            intro = f"Hello! I'm your AI interviewer today. I'll ask you several questions about your experience as a {job_role}. Please answer using your microphone. Take your time with each answer. Let's begin."
+            intro = f"Hello! I'm your AI interviewer today. I'll ask you several questions about your experience as a {job_role}. Please answer naturally. Let's begin."
             await realtime_client.speak_text(intro)
-            state["ai_speaking"] = True
+            state["waiting_for_ai"] = True
             
-            # Wait a bit, then ask first question
-            await asyncio.sleep(2)
+            # Wait for intro to finish
+            await asyncio.sleep(8)
+            
+            # Ask first question
             await self._ask_question(websocket, realtime_client, questions, state)
 
             # Main loop
             while not state["ended"]:
                 elapsed = time.time() - state["start_time"]
 
-                # Receive message from client
+                # Check if time to wrap up (after 7:30)
+                if elapsed >= 450 and not state["wrap_up_initiated"]:
+                    # Just mark, don't interrupt current answer
+                    pass
+
+                # Receive message from frontend
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
                     message = json.loads(raw)
@@ -115,7 +130,7 @@ class VoiceInterviewHandler:
 
                 msg_type = message.get("type")
 
-                # Candidate finished speaking
+                # Candidate finished speaking (from speech recognition)
                 if msg_type == "response_complete":
                     response_text = message.get("transcript", "")
                     
@@ -127,16 +142,22 @@ class VoiceInterviewHandler:
 
                     # Decide: ask next or wrap up?
                     if elapsed < 450:  # Before 7:30
-                        await asyncio.sleep(1.5)
+                        await asyncio.sleep(2)
                         await self._ask_question(websocket, realtime_client, questions, state)
-                    else:  # After 7:30, wrap up
+                    else:  # After 7:30
                         if not state["wrap_up_initiated"]:
-                            await self._wrap_up(websocket, realtime_client, db, interview, state, questions)
+                            await self._wrap_up(websocket, realtime_client, db, interview, state)
                             state["ended"] = True
+
+                # Candidate audio chunk (if we want to send to Azure)
+                elif msg_type == "audio_chunk":
+                    audio_b64 = message.get("audio", "")
+                    if audio_b64 and realtime_client.connected:
+                        await realtime_client.send_audio_chunk(audio_b64)
 
                 # Manual end
                 elif msg_type == "end":
-                    await self._wrap_up(websocket, realtime_client, db, interview, state, questions)
+                    await self._wrap_up(websocket, realtime_client, db, interview, state)
                     state["ended"] = True
 
             # Save final data
@@ -150,6 +171,8 @@ class VoiceInterviewHandler:
 
         except Exception as e:
             print(f"Voice interview error: {e}")
+            import traceback
+            traceback.print_exc()
             await self._send(websocket, {"type": "error", "message": str(e)})
 
         finally:
@@ -158,10 +181,11 @@ class VoiceInterviewHandler:
             db.close()
             try:
                 await websocket.close()
-            except Exception:
+            except:
                 pass
 
     async def _ask_question(self, websocket, realtime_client, questions, state):
+        """Ask next question via AI voice."""
         idx = state["current_question_index"]
         
         if idx >= len(questions):
@@ -173,7 +197,7 @@ class VoiceInterviewHandler:
         state["questions_asked"].append(question_text)
         state["current_question_index"] += 1
 
-        # Send question text to frontend
+        # Send question text to frontend (for display)
         await self._send(websocket, {
             "type": "question",
             "text": question_text,
@@ -182,14 +206,16 @@ class VoiceInterviewHandler:
 
         # AI speaks the question
         await realtime_client.speak_text(question_text)
+        state["waiting_for_ai"] = True
 
-    async def _wrap_up(self, websocket, realtime_client, db, interview, state, questions):
+    async def _wrap_up(self, websocket, realtime_client, db, interview, state):
+        """End interview gracefully."""
         state["wrap_up_initiated"] = True
         
-        closing = "Thank you for that answer. That wraps up our interview today. You did great! I'm now generating your personalized feedback report."
-        await realtime_client.speak_text(closing)
+        closing = "Thank you for your answers. That wraps up our interview today. You did great! I'm now generating your personalized feedback report."
         
-        await asyncio.sleep(3)
+        await realtime_client.speak_text(closing)
+        await asyncio.sleep(5)
         
         await self._send(websocket, {
             "type": "ended",
@@ -199,7 +225,8 @@ class VoiceInterviewHandler:
         })
 
     async def _send(self, websocket: WebSocket, data: dict):
+        """Send message to frontend."""
         try:
             await websocket.send_text(json.dumps(data))
-        except Exception:
+        except:
             pass
