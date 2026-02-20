@@ -1,5 +1,3 @@
-// ai-interview-frontend/src/hooks/useSpeechRecognition.ts
-
 import { useEffect, useRef, useState } from 'react';
 
 interface UseSpeechRecognitionProps {
@@ -14,14 +12,24 @@ export function useSpeechRecognition({
   enabled
 }: UseSpeechRecognitionProps) {
   const recognitionRef = useRef<any>(null);
+  const enabledRef = useRef(enabled);
+  const restartAttempts = useRef(0);
+
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (typeof window === 'undefined' || !enabled) return;
+  const MAX_RESTARTS = 3;
 
-    const SpeechRecognition = 
-      (window as any).SpeechRecognition || 
+  // Keep latest enabled value
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const SpeechRecognition =
+      (window as any).SpeechRecognition ||
       (window as any).webkitSpeechRecognition;
 
     if (!SpeechRecognition) {
@@ -33,93 +41,91 @@ export function useSpeechRecognition({
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.lang = 'en-US';
-    recognition.maxAlternatives = 1;
 
     recognition.onstart = () => {
-      console.log('🎤 Speech recognition started');
+      console.log('✅ Speech recognition started');
       setIsListening(true);
     };
 
     recognition.onresult = (event: any) => {
-      let interimText = '';
-      let finalText = '';
-      let hasSpeech = false;
+      let speaking = false;
 
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const transcript = event.results[i][0].transcript;
-        
+
         if (event.results[i].isFinal) {
-          finalText += transcript + ' ';
           onTranscript(transcript, true);
         } else {
-          interimText += transcript;
           onTranscript(transcript, false);
-          hasSpeech = true;
+          speaking = true;
         }
       }
 
-      onSpeakingChange(hasSpeech || finalText.length > 0);
+      onSpeakingChange(speaking);
     };
 
     recognition.onerror = (event: any) => {
-      console.error('Speech recognition error:', event.error);
+      console.error('❌ Speech error:', event.error);
       setError(event.error);
-
-      // Auto-restart on network error
-      if (event.error === 'network') {
-        setTimeout(() => {
-          if (enabled) {
-            try {
-              recognition.start();
-            } catch (e) {
-              console.log('Already started');
-            }
-          }
-        }, 1000);
-      }
     };
 
     recognition.onend = () => {
       console.log('Speech recognition ended');
       setIsListening(false);
 
-      // Auto-restart if still enabled
-      if (enabled) {
-        setTimeout(() => {
-          try {
-            recognition.start();
-          } catch (e) {
-            console.log('Failed to restart');
-          }
-        }, 100);
+      if (!enabledRef.current) return;
+
+      if (restartAttempts.current >= MAX_RESTARTS) {
+        console.error('❌ Max restart attempts reached');
+        setError('Speech recognition failed');
+        return;
       }
+
+      restartAttempts.current++;
+
+      setTimeout(() => {
+        try {
+          recognition.start();
+        } catch (err) {
+          console.log('Restart failed');
+        }
+      }, 1500);
     };
 
     recognitionRef.current = recognition;
 
-    // Start recognition
-    try {
-      recognition.start();
-    } catch (e) {
-      console.error('Failed to start recognition:', e);
+    if (enabled) {
+      try {
+        recognition.start();
+      } catch (err) {
+        console.error('Initial start failed');
+      }
     }
 
     return () => {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.stop();
-        } catch (e) {}
-      }
+      recognition.onend = null; // prevent auto restart on unmount
+      recognition.stop();
     };
-  }, [enabled, onTranscript, onSpeakingChange]);
+  }, []);
+
+  // Control start/stop based on enabled
+  useEffect(() => {
+    const recognition = recognitionRef.current;
+    if (!recognition) return;
+
+    if (enabled) {
+      restartAttempts.current = 0;
+      try {
+        recognition.start();
+      } catch {}
+    } else {
+      recognition.stop();
+    }
+  }, [enabled]);
 
   const stop = () => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-        setIsListening(false);
-      } catch (e) {}
-    }
+    enabledRef.current = false;
+    recognitionRef.current?.stop();
   };
 
   return {
