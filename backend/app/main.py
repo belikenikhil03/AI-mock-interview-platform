@@ -46,13 +46,15 @@ from app.api.endpoints.auth_endpoints import router as auth_router
 from app.api.endpoints.resume_endpoints import router as resumes_router
 from app.api.endpoints.interview_endpoints import router as interviews_router
 from app.api.endpoints.feedback_endpoints import router as feedback_router
-from app.api.endpoints.recordings_endpoint import router as recordings_router  # NEW
+from app.api.endpoints.recordings_endpoint import router as recordings_router
+from app.api.endpoints.speech_endpoint import router as speech_router
 
 app.include_router(auth_router, prefix="/api/auth", tags=["Authentication"])
 app.include_router(resumes_router, prefix="/api/resumes", tags=["Resumes"])
 app.include_router(interviews_router, prefix="/api/interviews", tags=["Interviews"])
 app.include_router(feedback_router, prefix="/api/feedback", tags=["Feedback"])
-app.include_router(recordings_router, prefix="/api/recordings", tags=["Recordings"])  # NEW
+app.include_router(recordings_router, prefix="/api/recordings", tags=["Recordings"])
+app.include_router(speech_router, prefix="/api/speech", tags=["Speech"])
 
 
 # ── WebSocket for Voice Interview ────────────────────────────────────────────

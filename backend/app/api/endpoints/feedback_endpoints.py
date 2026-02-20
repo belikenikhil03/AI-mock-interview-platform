@@ -64,11 +64,9 @@ async def get_feedback_with_timeline(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Get feedback along with video timeline for playback.
-    Used in the feedback page with video player.
-    """
+    """Get feedback along with video timeline for playback."""
     from app.services.recording.event_logger import EventLogger
+    from app.services.storage.storage_service import StorageService  # ADD THIS
     
     # Get feedback
     service = FeedbackService()
@@ -83,6 +81,12 @@ async def get_feedback_with_timeline(
     # Get timeline events
     events = EventLogger.get_timeline(db, interview_id)
     grouped = EventLogger.group_nearby_events(events, time_window=5.0)
+    
+    # Generate SAS URL for video (ADD THIS BLOCK)
+    video_url = None
+    if interview.video_blob_url:
+        storage = StorageService()
+        video_url = storage.get_video_sas_url(interview.video_blob_url, expiry_hours=24)
     
     return {
         "feedback": {
@@ -100,7 +104,7 @@ async def get_feedback_with_timeline(
             "improvement_suggestions": feedback.improvement_suggestions
         },
         "video": {
-            "url": interview.video_blob_url,
+            "url": video_url,  # CHANGED: Now SAS URL instead of blob URL
             "duration_seconds": interview.video_duration_seconds,
             "total_events": len(events)
         },

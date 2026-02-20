@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     AZURE_SQL_USERNAME: str
     AZURE_SQL_PASSWORD: str
 
+    #Azure Speech
+    AZURE_SPEECH_KEY: str
+    AZURE_SPEECH_REGION: str = "centralindia"
+
     # Azure OpenAI - shared
     AZURE_OPENAI_ENDPOINT: str = ""
     AZURE_OPENAI_API_KEY: str = ""

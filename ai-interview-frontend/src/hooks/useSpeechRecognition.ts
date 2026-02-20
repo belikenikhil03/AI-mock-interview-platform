@@ -1,3 +1,5 @@
+// ai-interview-frontend/src/hooks/useSpeechRecognition.ts
+
 import { useEffect, useRef, useState } from 'react';
 
 interface UseSpeechRecognitionProps {
@@ -6,131 +8,280 @@ interface UseSpeechRecognitionProps {
   enabled: boolean;
 }
 
+declare global {
+  interface Window {
+    SpeechSDK?: any;
+  }
+}
+
+const SPEECH_SDK_SCRIPT_ID = 'azure-speech-sdk-script';
+const SPEECH_SDK_SCRIPT_SRC = 'https://aka.ms/csspeech/jsbrowserpackageraw';
+
+async function loadAzureSpeechSDK(): Promise<any> {
+  if (typeof window === 'undefined') {
+    throw new Error('Browser environment is required for Azure Speech SDK.');
+  }
+
+  if (window.SpeechSDK) return window.SpeechSDK;
+
+  const existingScript = document.getElementById(SPEECH_SDK_SCRIPT_ID) as HTMLScriptElement | null;
+
+  if (existingScript) {
+    await new Promise<void>((resolve, reject) => {
+      if (window.SpeechSDK) {
+        resolve();
+        return;
+      }
+
+      existingScript.addEventListener('load', () => resolve(), { once: true });
+      existingScript.addEventListener('error', () => reject(new Error('Failed to load Azure Speech SDK script.')), {
+        once: true,
+      });
+    });
+
+    if (!window.SpeechSDK) {
+      throw new Error('Azure Speech SDK script loaded, but SpeechSDK is unavailable.');
+    }
+
+    return window.SpeechSDK;
+  }
+
+  const script = document.createElement('script');
+  script.id = SPEECH_SDK_SCRIPT_ID;
+  script.src = SPEECH_SDK_SCRIPT_SRC;
+  script.async = true;
+
+  const loaded = new Promise<void>((resolve, reject) => {
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Failed to load Azure Speech SDK script.'));
+  });
+
+  document.head.appendChild(script);
+  await loaded;
+
+  if (!window.SpeechSDK) {
+    throw new Error('Azure Speech SDK loaded but SpeechSDK is undefined.');
+  }
+
+  return window.SpeechSDK;
+}
+
 export function useSpeechRecognition({
   onTranscript,
   onSpeakingChange,
-  enabled
+  enabled,
 }: UseSpeechRecognitionProps) {
-  const recognitionRef = useRef<any>(null);
+  const recognizerRef = useRef<any>(null);
+  const speechConfigRef = useRef<any>(null);
+  const audioConfigRef = useRef<any>(null);
+
+  const onTranscriptRef = useRef(onTranscript);
+  const onSpeakingChangeRef = useRef(onSpeakingChange);
   const enabledRef = useRef(enabled);
-  const restartAttempts = useRef(0);
+  const manuallyStoppedRef = useRef(false);
+  const restartTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const restartAttemptRef = useRef(0);
 
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const MAX_RESTARTS = 3;
+  useEffect(() => {
+    onTranscriptRef.current = onTranscript;
+    onSpeakingChangeRef.current = onSpeakingChange;
+  }, [onTranscript, onSpeakingChange]);
 
-  // Keep latest enabled value
   useEffect(() => {
     enabledRef.current = enabled;
   }, [enabled]);
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
+  const clearRestartTimer = () => {
+    if (restartTimeoutRef.current) {
+      clearTimeout(restartTimeoutRef.current);
+      restartTimeoutRef.current = null;
+    }
+  };
 
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
+  const stopAndDisposeRecognizer = () => {
+    const recognizer = recognizerRef.current;
+    recognizerRef.current = null;
 
-    if (!SpeechRecognition) {
-      setError('Speech recognition not supported');
-      return;
+    if (recognizer) {
+      recognizer.stopContinuousRecognitionAsync(
+        () => {
+          recognizer.close();
+        },
+        () => {
+          recognizer.close();
+        }
+      );
     }
 
-    const recognition = new SpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = 'en-US';
-
-    recognition.onstart = () => {
-      console.log('✅ Speech recognition started');
-      setIsListening(true);
-    };
-
-    recognition.onresult = (event: any) => {
-      let speaking = false;
-
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const transcript = event.results[i][0].transcript;
-
-        if (event.results[i].isFinal) {
-          onTranscript(transcript, true);
-        } else {
-          onTranscript(transcript, false);
-          speaking = true;
-        }
+    if (audioConfigRef.current) {
+      try {
+        audioConfigRef.current.close?.();
+      } catch {
+        // noop
       }
+      audioConfigRef.current = null;
+    }
+  };
 
-      onSpeakingChange(speaking);
-    };
+  const scheduleRestart = (reason: 'network' | 'service' | 'normal') => {
+    if (!enabledRef.current || manuallyStoppedRef.current) return;
+    if (restartTimeoutRef.current) return;
 
-    recognition.onerror = (event: any) => {
-      console.error('❌ Speech error:', event.error);
-      setError(event.error);
-    };
+    restartAttemptRef.current += 1;
 
-    recognition.onend = () => {
-      console.log('Speech recognition ended');
-      setIsListening(false);
+    let delayMs = 1000;
+    if (reason === 'network' || reason === 'service') {
+      delayMs = Math.min(30000, 1000 * 2 ** Math.min(restartAttemptRef.current, 5));
+    }
 
-      if (!enabledRef.current) return;
+    restartTimeoutRef.current = setTimeout(() => {
+      restartTimeoutRef.current = null;
+      void startRecognition();
+    }, delayMs);
+  };
 
-      if (restartAttempts.current >= MAX_RESTARTS) {
-        console.error('❌ Max restart attempts reached');
-        setError('Speech recognition failed');
+  const startRecognition = async () => {
+    if (!enabledRef.current || manuallyStoppedRef.current) return;
+
+    clearRestartTimer();
+    stopAndDisposeRecognizer();
+
+    try {
+      const speechKey = process.env.NEXT_PUBLIC_AZURE_SPEECH_KEY;
+      const speechRegion = process.env.NEXT_PUBLIC_AZURE_SPEECH_REGION;
+      const speechLanguage = process.env.NEXT_PUBLIC_AZURE_SPEECH_LANGUAGE || 'en-US';
+
+      if (!speechKey || !speechRegion) {
+        setError('Missing Azure Speech config. Set NEXT_PUBLIC_AZURE_SPEECH_KEY and NEXT_PUBLIC_AZURE_SPEECH_REGION.');
         return;
       }
 
-      restartAttempts.current++;
+      const SpeechSDK = await loadAzureSpeechSDK();
 
-      setTimeout(() => {
-        try {
-          recognition.start();
-        } catch (err) {
-          console.log('Restart failed');
+      const speechConfig = SpeechSDK.SpeechConfig.fromSubscription(speechKey, speechRegion);
+      speechConfig.speechRecognitionLanguage = speechLanguage;
+
+      const audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+      const recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+
+      speechConfigRef.current = speechConfig;
+      audioConfigRef.current = audioConfig;
+      recognizerRef.current = recognizer;
+
+      recognizer.recognizing = (_: any, event: any) => {
+        const text = event?.result?.text?.trim?.() ?? '';
+        if (!text) return;
+
+        setIsListening(true);
+        onSpeakingChangeRef.current(true);
+        onTranscriptRef.current(text, false);
+      };
+
+      recognizer.recognized = (_: any, event: any) => {
+        const result = event?.result;
+        const text = result?.text?.trim?.() ?? '';
+
+        if (result?.reason === SpeechSDK.ResultReason.RecognizedSpeech && text) {
+          onTranscriptRef.current(text, true);
         }
-      }, 1500);
-    };
 
-    recognitionRef.current = recognition;
+        onSpeakingChangeRef.current(false);
+      };
+
+      recognizer.sessionStarted = () => {
+        setIsListening(true);
+        setError(null);
+        restartAttemptRef.current = 0;
+      };
+
+      recognizer.sessionStopped = () => {
+        setIsListening(false);
+        onSpeakingChangeRef.current(false);
+
+        if (!enabledRef.current || manuallyStoppedRef.current) return;
+        scheduleRestart('normal');
+      };
+
+      recognizer.canceled = (_: any, event: any) => {
+        setIsListening(false);
+        onSpeakingChangeRef.current(false);
+
+        const reason = event?.reason;
+        const errorDetails = event?.errorDetails || 'Speech recognition cancelled.';
+
+        if (reason === SpeechSDK.CancellationReason.EndOfStream && !manuallyStoppedRef.current) {
+          scheduleRestart('normal');
+          return;
+        }
+
+        setError(errorDetails);
+
+        if (!enabledRef.current || manuallyStoppedRef.current) return;
+
+        if (reason === SpeechSDK.CancellationReason.Error) {
+          const lower = String(errorDetails).toLowerCase();
+          if (lower.includes('network') || lower.includes('connection')) {
+            scheduleRestart('network');
+          } else {
+            scheduleRestart('service');
+          }
+        }
+      };
+
+      await new Promise<void>((resolve, reject) => {
+        recognizer.startContinuousRecognitionAsync(
+          () => resolve(),
+          (err: any) => reject(err)
+        );
+      });
+
+      setIsListening(true);
+    } catch (err: any) {
+      setIsListening(false);
+      onSpeakingChangeRef.current(false);
+      setError(err?.message || 'Failed to start Azure Speech recognition.');
+      scheduleRestart('service');
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    manuallyStoppedRef.current = !enabled;
 
     if (enabled) {
-      try {
-        recognition.start();
-      } catch (err) {
-        console.error('Initial start failed');
-      }
+      void startRecognition();
+    } else {
+      clearRestartTimer();
+      stopAndDisposeRecognizer();
+      setIsListening(false);
+      onSpeakingChangeRef.current(false);
     }
 
     return () => {
-      recognition.onend = null; // prevent auto restart on unmount
-      recognition.stop();
+      manuallyStoppedRef.current = true;
+      clearRestartTimer();
+      stopAndDisposeRecognizer();
+      setIsListening(false);
+      onSpeakingChangeRef.current(false);
     };
-  }, []);
-
-  // Control start/stop based on enabled
-  useEffect(() => {
-    const recognition = recognitionRef.current;
-    if (!recognition) return;
-
-    if (enabled) {
-      restartAttempts.current = 0;
-      try {
-        recognition.start();
-      } catch {}
-    } else {
-      recognition.stop();
-    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled]);
 
   const stop = () => {
-    enabledRef.current = false;
-    recognitionRef.current?.stop();
+    manuallyStoppedRef.current = true;
+    clearRestartTimer();
+    stopAndDisposeRecognizer();
+    setIsListening(false);
+    onSpeakingChangeRef.current(false);
   };
 
   return {
     isListening,
     error,
-    stop
+    stop,
   };
 }

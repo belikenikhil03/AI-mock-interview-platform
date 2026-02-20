@@ -8,6 +8,7 @@ import { useSpeechRecognition } from '@/hooks/useSpeechRecognition';
 import { useVideoRecorder } from '@/hooks/useVideoRecorder';
 import { MicrophoneRecorder } from '@/utils/audioUtils';
 import { UploadService } from '@/services/uploadService';
+import { useAzureSpeech } from '@/hooks/useAzureSpeech';
 
 export default function VoiceInterviewPage() {
   const router = useRouter();
@@ -86,7 +87,7 @@ export default function VoiceInterviewPage() {
     setCandidateSpeaking(speaking);
   };
 
-  const speechRecognition = useSpeechRecognition({
+  const speechRecognition = useAzureSpeech({
     onTranscript: handleTranscript,
     onSpeakingChange: handleSpeakingChange,
     enabled: interviewState.status === 'active'

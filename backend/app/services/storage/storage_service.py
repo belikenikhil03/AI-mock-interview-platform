@@ -1,8 +1,8 @@
 """
-Updated Storage Service with video upload support.
-REPLACE: backend/app/services/storage/storage_service.py
+RECOMMENDED FIX: Generate SAS URL for video playback
+UPDATE: backend/app/services/storage/storage_service.py
 """
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import BlobServiceClient, ContentSettings, generate_blob_sas, BlobSasPermissions
 from datetime import datetime, timedelta
 import uuid
 
@@ -18,12 +18,7 @@ class StorageService:
         self.container_name = settings.AZURE_STORAGE_CONTAINER_NAME
 
     def upload_resume(self, file_data: bytes, user_id: int) -> tuple:
-        """
-        Upload resume PDF to blob storage.
-        
-        Returns:
-            (blob_url, file_size)
-        """
+        """Upload resume PDF to blob storage."""
         filename = f"resumes/user_{user_id}/{uuid.uuid4()}.pdf"
         
         blob_client = self.blob_service.get_blob_client(
@@ -43,26 +38,14 @@ class StorageService:
         return blob_url, file_size
 
     def upload_video(self, file_data, blob_path: str) -> str:
-        """
-        Upload interview video recording to blob storage.
-        Sets 30-day retention policy.
-        
-        Args:
-            file_data: File bytes or file-like object
-            blob_path: Path in blob storage (e.g., 'interviews/user_3/interview_5/recording.webm')
-        
-        Returns:
-            blob_url: Full URL to the uploaded video
-        """
+        """Upload interview video recording to blob storage."""
         blob_client = self.blob_service.get_blob_client(
             container=self.container_name,
             blob=blob_path
         )
         
-        # Set retention - video auto-deletes after 30 days
         expiry_time = datetime.utcnow() + timedelta(days=settings.VIDEO_RETENTION_DAYS)
         
-        # Upload video
         blob_client.upload_blob(
             file_data,
             overwrite=True,
@@ -74,6 +57,39 @@ class StorageService:
         )
         
         return blob_client.url
+
+    def get_video_sas_url(self, blob_url: str, expiry_hours: int = 24) -> str:
+        """
+        Generate a SAS URL for video playback.
+        This allows the frontend to access the video without CORS issues.
+        
+        Args:
+            blob_url: The blob URL from database
+            expiry_hours: How long the URL should be valid (default 24 hours)
+        
+        Returns:
+            SAS URL that can be used directly in video player
+        """
+        # Extract blob name from URL
+        blob_name = blob_url.split(f"{self.container_name}/")[-1]
+        
+        # Get account name and key from connection string
+        conn_parts = dict(item.split('=', 1) for item in settings.AZURE_STORAGE_CONNECTION_STRING.split(';') if '=' in item)
+        account_name = conn_parts.get('AccountName')
+        account_key = conn_parts.get('AccountKey')
+        
+        # Generate SAS token
+        sas_token = generate_blob_sas(
+            account_name=account_name,
+            container_name=self.container_name,
+            blob_name=blob_name,
+            account_key=account_key,
+            permission=BlobSasPermissions(read=True),
+            expiry=datetime.utcnow() + timedelta(hours=expiry_hours)
+        )
+        
+        # Return full URL with SAS token
+        return f"{blob_url}?{sas_token}"
 
     def delete_blob(self, blob_url: str):
         """Delete a blob by URL."""
