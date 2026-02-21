@@ -1,7 +1,24 @@
 """
-Main FastAPI application - COMPLETE FILE
-REPLACE: backend/app/main.py
+COMPLETE top section of main.py - SQL logs WILL be fixed
+REPLACE lines 1-30 of: backend/app/main.py
 """
+import logging
+import sys
+
+# Configure logging FIRST - before ANY other imports
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    stream=sys.stdout
+)
+
+# Silence SQLAlchemy
+logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
+logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
+logging.getLogger('sqlalchemy.pool').setLevel(logging.WARNING)
+logging.getLogger('sqlalchemy.orm').setLevel(logging.WARNING)
+
+# NOW import everything
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,32 +26,30 @@ from app.core.config import settings
 from app.core.database import engine, Base, SessionLocal
 from app.core.security import decode_access_token
 
-# Import all models so SQLAlchemy creates tables
 from app.models.user import User as UserModel
 from app.models.resume import Resume
 from app.models.interview import Interview
 from app.models.feedback import Feedback
 from app.models.metric import InterviewMetric
-from app.models.interview_event import InterviewEvent  # NEW
+from app.models.interview_event import InterviewEvent
 
+# Create tables
 Base.metadata.create_all(bind=engine)
 
+# Create app
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
-    description="AI-powered mock interview platform with voice",
+    description="AI-powered mock interview platform",
     debug=settings.DEBUG
 )
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:3001",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-        "http://127.0.0.1:5500",
-        "http://localhost:5500",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -69,24 +84,27 @@ async def interview_websocket(
     """
     WebSocket endpoint for VOICE-based interview session.
     """
+    # Auth check (no database needed here)
+    payload = decode_access_token(token)
+    if not payload:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    user_id = int(payload.get("sub"))
+    
+    # Quick user validation
     db = SessionLocal()
     try:
-        payload = decode_access_token(token)
-        if not payload:
-            await websocket.close(code=4001, reason="Invalid token")
-            return
-
-        user_id = int(payload.get("sub"))
         user = db.query(UserModel).filter(UserModel.id == user_id).first()
-
+        print(f"@@@ USER FOUND: {user.email if user else 'NONE'} @@@")
         if not user or not user.is_active:
             await websocket.close(code=4001, reason="User not found")
             return
-
     finally:
-        db.close()
+        db.close()  # Close this temporary DB session
 
-    # Use voice interview handler (NEW)
+    # Now call handler - it will create its own DB session
+    print("@@@ ABOUT TO CREATE VOICE HANDLER @@@")
     handler = VoiceInterviewHandler()
     await handler.handle(websocket, session_id, user_id)
 

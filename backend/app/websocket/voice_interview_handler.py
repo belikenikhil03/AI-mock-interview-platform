@@ -1,5 +1,5 @@
 """
-Complete Voice Interview WebSocket Handler with Realtime API integration.
+WORKING VERSION with detailed logging
 REPLACE: backend/app/websocket/voice_interview_handler.py
 """
 import json
@@ -9,13 +9,11 @@ from datetime import datetime
 from fastapi import WebSocket
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.interview import InterviewStatus
 from app.services.interview.interview_service import InterviewService
 from app.services.interview.question_generator import QuestionGeneratorService
 from app.services.realtime.realtime_client import RealtimeAPIClient
-from app.services.recording.event_logger import EventLogger
 
 
 class VoiceInterviewHandler:
@@ -25,142 +23,121 @@ class VoiceInterviewHandler:
         self.question_generator = QuestionGeneratorService()
 
     async def handle(self, websocket: WebSocket, session_id: str, user_id: int):
+        print("\n" + "="*80)
+        print("[INTERVIEW] Starting new interview")
+        print("="*80 + "\n")
+        
         await websocket.accept()
         db = SessionLocal()
         realtime_client = None
 
         try:
-            # Load interview session
             interview = self.interview_service._get_session(db, session_id, user_id)
-            
-            if interview.status == InterviewStatus.CANCELLED:
-                await self._send(websocket, {"type": "error", "message": "Session cancelled"})
-                return
-
-            # Generate questions
             resume = interview.resume
             job_role = interview.job_role or "Software Engineer"
-            skills = resume.skills if resume else []
-            exp_years = resume.experience_years if resume else None
-
+            
             questions = await self.question_generator.generate_questions(
                 job_role=job_role,
-                skills=skills,
-                experience_years=exp_years,
+                skills=resume.skills if resume else [],
+                experience_years=resume.experience_years if resume else None,
                 interview_type=interview.interview_type or "job_role",
-                num_questions=20
+                num_questions=10
             )
 
-            # Start interview
+            print(f"[INTERVIEW] Generated {len(questions)} questions")
+
             self.interview_service.start_session(db, session_id, user_id)
 
-            # Connect to Azure Realtime API
+            # Connect Realtime API
             realtime_client = RealtimeAPIClient()
-            connected = await realtime_client.connect()
-            
-            if not connected:
-                await self._send(websocket, {"type": "error", "message": "Failed to connect to AI service"})
+            if not await realtime_client.connect():
+                print("[INTERVIEW] Failed to connect to Realtime API")
                 return
 
-            # Setup callbacks for audio streaming
+            # Callbacks with logging
             async def on_audio(audio_b64: str):
-                await self._send(websocket, {
-                    "type": "ai_audio",
-                    "audio": audio_b64
-                })
+                await self._send(websocket, {"type": "ai_audio", "audio": audio_b64})
 
             async def on_transcript(text: str):
-                print(f"AI transcript: {text}")
+                print(f"[AI SPEAKING] {text}", end="", flush=True)
+                await self._send(websocket, {"type": "ai_transcript_delta", "text": text})
 
             async def on_done():
-                await self._send(websocket, {
-                    "type": "ai_done_speaking"
-                })
+                print("\n[AI] Done speaking\n")
+                await self._send(websocket, {"type": "ai_done_speaking"})
 
             realtime_client.on_audio_callback = on_audio
             realtime_client.on_transcript_callback = on_transcript
             realtime_client.on_done_callback = on_done
 
-            # State
             state = {
                 "current_question_index": 0,
                 "questions_asked": [],
                 "responses": [],
                 "start_time": time.time(),
                 "ended": False,
-                "wrap_up_initiated": False,
-                "waiting_for_ai": False
+                "waiting_for_candidate": False
             }
 
-            # Send ready
-            await self._send(websocket, {
-                "type": "ready",
-                "session_id": session_id,
-                "job_role": job_role
-            })
+            await self._send(websocket, {"type": "ready", "session_id": session_id})
 
-            # AI Introduction
-            intro = f"Hello! I'm your AI interviewer today. I'll ask you several questions about your experience as a {job_role}. Please answer naturally. Let's begin."
+            # Intro
+            intro = f"Hello! I'm your AI interviewer. I'll ask you questions about {job_role}. Let's begin."
+            print(f"\n[AI INTRO] {intro}\n")
             await realtime_client.speak_text(intro)
-            state["waiting_for_ai"] = True
             
-            # Wait for intro to finish
-            await asyncio.sleep(8)
+            await asyncio.sleep(12)
             
             # Ask first question
             await self._ask_question(websocket, realtime_client, questions, state)
+            state["waiting_for_candidate"] = True
 
             # Main loop
             while not state["ended"]:
                 elapsed = time.time() - state["start_time"]
 
-                # Check if time to wrap up (after 7:30)
-                if elapsed >= 450 and not state["wrap_up_initiated"]:
-                    # Just mark, don't interrupt current answer
-                    pass
-
-                # Receive message from frontend
                 try:
                     raw = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
                     message = json.loads(raw)
                 except asyncio.TimeoutError:
+                    if elapsed > 480:
+                        state["ended"] = True
                     continue
-                except Exception:
+                except:
                     break
 
                 msg_type = message.get("type")
 
-                # Candidate finished speaking (from speech recognition)
-                if msg_type == "response_complete":
-                    response_text = message.get("transcript", "")
+                if msg_type == "response_complete" and state["waiting_for_candidate"]:
+                    response_text = message.get("transcript", "").strip()
+                    
+                    if not response_text:
+                        continue
+                    
+                    print(f"\n[CANDIDATE ANSWER] {response_text}\n")
                     
                     state["responses"].append({
                         "question_index": state["current_question_index"] - 1,
-                        "response": response_text,
-                        "timestamp": datetime.utcnow().isoformat()
+                        "response": response_text
                     })
 
-                    # Decide: ask next or wrap up?
-                    if elapsed < 450:  # Before 7:30
-                        await asyncio.sleep(2)
+                    state["waiting_for_candidate"] = False
+                    
+                    await asyncio.sleep(3)
+                    
+                    if elapsed < 450 and state["current_question_index"] < len(questions):
                         await self._ask_question(websocket, realtime_client, questions, state)
-                    else:  # After 7:30
-                        if not state["wrap_up_initiated"]:
-                            await self._wrap_up(websocket, realtime_client, db, interview, state)
-                            state["ended"] = True
+                        state["waiting_for_candidate"] = True
+                    else:
+                        await self._wrap_up(websocket, realtime_client, interview)
+                        state["ended"] = True
 
-                # Candidate audio chunk (if we want to send to Azure)
-                elif msg_type == "audio_chunk":
-                    audio_b64 = message.get("audio", "")
-                    if audio_b64 and realtime_client.connected:
-                        await realtime_client.send_audio_chunk(audio_b64)
-
-                # Manual end
                 elif msg_type == "end":
-                    await self._wrap_up(websocket, realtime_client, db, interview, state)
+                    print("\n[INTERVIEW] Candidate ended interview\n")
+                    await self._wrap_up(websocket, realtime_client, interview)
                     state["ended"] = True
 
-            # Save final data
+            # Save
             self.interview_service.end_session(
                 db=db,
                 session_id=session_id,
@@ -169,11 +146,14 @@ class VoiceInterviewHandler:
                 responses_given=state["responses"]
             )
 
+            print("\n" + "="*80)
+            print("[INTERVIEW] Interview completed")
+            print("="*80 + "\n")
+
         except Exception as e:
-            print(f"Voice interview error: {e}")
+            print(f"\n[ERROR] {e}\n")
             import traceback
             traceback.print_exc()
-            await self._send(websocket, {"type": "error", "message": str(e)})
 
         finally:
             if realtime_client:
@@ -185,47 +165,32 @@ class VoiceInterviewHandler:
                 pass
 
     async def _ask_question(self, websocket, realtime_client, questions, state):
-        """Ask next question via AI voice."""
         idx = state["current_question_index"]
         
         if idx >= len(questions):
             return
 
-        question_data = questions[idx]
-        question_text = question_data["question"]
-        
+        question_text = questions[idx]["question"]
         state["questions_asked"].append(question_text)
         state["current_question_index"] += 1
 
-        # Send question text to frontend (for display)
-        await self._send(websocket, {
-            "type": "question",
-            "text": question_text,
-            "index": idx + 1
-        })
+        print(f"\n{'='*80}")
+        print(f"[QUESTION {idx + 1}] {question_text}")
+        print('='*80 + "\n")
 
-        # AI speaks the question
+        await self._send(websocket, {"type": "question", "index": idx + 1})
         await realtime_client.speak_text(question_text)
-        state["waiting_for_ai"] = True
+        await asyncio.sleep(15)
 
-    async def _wrap_up(self, websocket, realtime_client, db, interview, state):
-        """End interview gracefully."""
-        state["wrap_up_initiated"] = True
-        
-        closing = "Thank you for your answers. That wraps up our interview today. You did great! I'm now generating your personalized feedback report."
-        
+    async def _wrap_up(self, websocket, realtime_client, interview):
+        closing = "Thank you! Generating your feedback now."
+        print(f"\n[AI CLOSING] {closing}\n")
         await realtime_client.speak_text(closing)
-        await asyncio.sleep(5)
+        await asyncio.sleep(8)
         
-        await self._send(websocket, {
-            "type": "ended",
-            "interview_id": interview.id,
-            "total_questions": len(state["questions_asked"]),
-            "message": "Interview complete"
-        })
+        await self._send(websocket, {"type": "ended", "interview_id": interview.id})
 
     async def _send(self, websocket: WebSocket, data: dict):
-        """Send message to frontend."""
         try:
             await websocket.send_text(json.dumps(data))
         except:

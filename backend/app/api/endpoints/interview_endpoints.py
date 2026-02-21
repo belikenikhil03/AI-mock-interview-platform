@@ -15,7 +15,7 @@ from app.api.schemas.interview import (
     InterviewListResponse
 )
 from app.services.interview.interview_service import InterviewService
-from app.websocket.ws_handler import InterviewWebSocketHandler
+from app.websocket.voice_interview_handler import VoiceInterviewHandler as InterviewWebSocketHandler
 from app.models.user import User
 from app.core.security import decode_access_token
 from app.core.database import SessionLocal

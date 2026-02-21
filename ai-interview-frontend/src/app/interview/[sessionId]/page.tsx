@@ -120,6 +120,18 @@ export default function VoiceInterviewPage() {
   // Handle interview end
   useEffect(() => {
     if (interviewState.status === 'ended' && interviewState.interviewId) {
+      // IMMEDIATELY stop camera
+      const video = document.getElementById('interview-video') as HTMLVideoElement;
+      if (video?.srcObject) {
+        const stream = video.srcObject as MediaStream;
+        stream.getTracks().forEach(track => {
+          track.stop();
+          console.log(`Stopped ${track.kind} track`);
+        });
+        video.srcObject = null;
+      }
+      
+      // Then handle upload
       handleInterviewEnd();
     }
   }, [interviewState.status, interviewState.interviewId]);
@@ -159,51 +171,70 @@ export default function VoiceInterviewPage() {
   };
 
   const handleInterviewEnd = async () => {
-    setShowUpload(true);
+  setShowUpload(true);
 
-    try {
-      // Stop recording
-      const videoBlob = await videoRecorder.stopRecording();
-      const timeline = videoRecorder.getTimeline();
-      const duration = videoRecorder.getDuration();
+  // STOP CAMERA IMMEDIATELY
+  if (videoRef.current?.srcObject) {
+    const stream = videoRef.current.srcObject as MediaStream;
+    stream.getTracks().forEach(track => {
+      track.stop();
+      console.log('Stopped track:', track.kind);
+    });
+    videoRef.current.srcObject = null;
+  }
 
-      // Upload with progress
-      await UploadService.uploadWithProgress(
-        interviewState.interviewId!,
-        videoBlob,
-        timeline,
-        duration,
-        (percent) => setUploadProgress(percent)
-      );
+  try {
+    // Stop recording
+    const videoBlob = await videoRecorder.stopRecording();
+    const timeline = videoRecorder.getTimeline();
+    const duration = videoRecorder.getDuration();
 
-      console.log('✅ Upload complete');
-      
-      setTimeout(() => {
-        router.push(`/feedback/${interviewState.interviewId}`);
-      }, 1000);
+    // Upload with progress
+    await UploadService.uploadWithProgress(
+      interviewState.interviewId!,
+      videoBlob,
+      timeline,
+      duration,
+      (percent) => setUploadProgress(percent)
+    );
 
-    } catch (err) {
-      console.error('Upload error:', err);
-      setTimeout(() => {
-        router.push(`/feedback/${interviewState.interviewId}`);
-      }, 2000);
-    }
-  };
+    console.log('✅ Upload complete');
+    
+    setTimeout(() => {
+      router.push(`/feedback/${interviewState.interviewId}`);
+    }, 1000);
+
+  } catch (err) {
+    console.error('Upload error:', err);
+    setTimeout(() => {
+      router.push(`/feedback/${interviewState.interviewId}`);
+    }, 2000);
+  }
+};
 
   const cleanup = () => {
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-    }
-    if (micRecorderRef.current) {
-      micRecorderRef.current.stop();
-    }
-    if (videoRef.current?.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
-    }
-    voiceInterview.cleanup();
-    speechRecognition.stop();
-  };
+  console.log('Cleaning up interview...');
+  
+  if (silenceTimerRef.current) {
+    clearTimeout(silenceTimerRef.current);
+  }
+  if (micRecorderRef.current) {
+    micRecorderRef.current.stop();
+  }
+  
+  // STOP ALL VIDEO TRACKS
+  if (videoRef.current?.srcObject) {
+    const stream = videoRef.current.srcObject as MediaStream;
+    stream.getTracks().forEach(track => {
+      track.stop();
+      console.log('Cleanup: stopped track:', track.kind);
+    });
+    videoRef.current.srcObject = null;
+  }
+  
+  voiceInterview.cleanup();
+  speechRecognition.stop();
+};
 
   const endInterview = () => {
     if (confirm('End interview?')) {

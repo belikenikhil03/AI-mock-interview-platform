@@ -1,4 +1,5 @@
-// ai-interview-frontend/src/hooks/useVoiceInterview.ts
+// UPDATE: src/hooks/useVoiceInterview.ts
+// Add logging to see what messages are coming
 
 import { useState, useRef, useCallback } from 'react';
 import { AudioPlayer } from '@/utils/audioUtils';
@@ -39,6 +40,7 @@ export function useVoiceInterview({ sessionId, onStateChange }: UseVoiceIntervie
 
     // Initialize audio player
     audioPlayerRef.current = new AudioPlayer();
+    console.log('✅ AudioPlayer initialized');
 
     const wsUrl = `ws://localhost:8000/api/interviews/${sessionId}/ws?token=${token}`;
     const websocket = new WebSocket(wsUrl);
@@ -49,6 +51,7 @@ export function useVoiceInterview({ sessionId, onStateChange }: UseVoiceIntervie
 
     websocket.onmessage = async (event) => {
       const message = JSON.parse(event.data);
+      console.log('📨 WS Message:', message.type, message);  // DEBUG
       await handleMessage(message);
     };
 
@@ -68,29 +71,49 @@ export function useVoiceInterview({ sessionId, onStateChange }: UseVoiceIntervie
   const handleMessage = async (message: any) => {
     switch (message.type) {
       case 'ready':
+        console.log('📝 Interview ready');
         updateState({ status: 'ready' });
         break;
 
       case 'question':
+        console.log(`Question ${message.index} starting`);
         updateState({
           status: 'active',
-          currentQuestion: message.text,
+          currentQuestion: '',  // Clear for streaming
           questionIndex: message.index,
           aiSpeaking: true
         });
         break;
 
       case 'ai_audio':
+        console.log('🔊 Audio chunk received, length:', message.audio?.length);
         if (audioPlayerRef.current) {
-          await audioPlayerRef.current.playChunk(message.audio);
+          console.log('📢 Playing audio chunk...');
+          try {
+            await audioPlayerRef.current.playChunk(message.audio);
+            console.log('✅ Audio played');
+          } catch (err) {
+            console.error('❌ Audio play error:', err);
+          }
+        } else {
+          console.error('❌ No AudioPlayer instance!');
         }
         break;
+      
+      case 'ai_transcript_delta':
+        // Stream AI text word by word as it speaks
+        updateState({ 
+          currentQuestion: (state.current.currentQuestion || '') + message.text
+        });
+        break;  
 
       case 'ai_done_speaking':
+        console.log('✅ AI finished speaking');
         updateState({ aiSpeaking: false });
         break;
 
       case 'ended':
+        console.log('🏁 Interview ended');
         updateState({
           status: 'ended',
           interviewId: message.interview_id
@@ -98,13 +121,17 @@ export function useVoiceInterview({ sessionId, onStateChange }: UseVoiceIntervie
         break;
 
       case 'error':
-        console.error('Interview error:', message.message);
+        console.error('❌ Interview error:', message.message);
         break;
+        
+      default:
+        console.log('⚠️ Unknown message type:', message.type);
     }
   };
 
   const sendTranscript = useCallback((transcript: string) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
+      console.log('📤 Sending transcript:', transcript.slice(0, 50));
       ws.send(JSON.stringify({
         type: 'response_complete',
         transcript
